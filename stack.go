@@ -19,11 +19,19 @@ func (s *stack) Push(value string) {
 	s.size++
 }
 
-func (s *stack) Pop() (value string) {
-	if s.size > 0 {
-		value, s.top = s.top.value, s.top.next
-		s.size--
-		return
+func (s *stack) Peek() *string {
+	if s.size == 0 {
+		return nil
 	}
-	return ""
+	return &s.top.value
+}
+
+func (s *stack) Pop() *string {
+	if s.size > 0 {
+		var v string
+		v, s.top = s.top.value, s.top.next
+		s.size--
+		return &v
+	}
+	return nil
 }
