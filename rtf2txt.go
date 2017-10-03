@@ -42,7 +42,13 @@ func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
 	control := string(data)
 	if control == "*" { // this is an extended control sequence
 		err := readUntilClosingBrace(r)
-		return err
+		if err != nil {
+			return err
+		}
+		if last := s.Peek(); last != nil {
+			return handleParam(r, *last) // last control was interrupted, so finish handling Params
+		}
+		return nil
 	}
 	if isUnicode, u := getUnicode(control); isUnicode {
 		text.WriteString(u)
@@ -70,19 +76,8 @@ func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
 		return nil
 	}
 
-	ccontrol, _ := canonicalize(control)
-	if isValue(ccontrol) || isToggle(ccontrol) || isDestination(control) { // Skip any parameter
-		_, err := peekingReader.ReadUntilAny(r, []byte{'\\', '{', '}', '\n', '\r', ';'})
-		if err != nil {
-			return err
-		}
-		p, err := r.Peek(1)
-		if err != nil {
-			return err
-		}
-		if p[0] == ';' { // skip next if it is a semicolon
-			r.ReadByte()
-		}
+	if err := handleParam(r, control); err != nil {
+		return err
 	}
 	s.Push(control)
 	return nil
@@ -105,6 +100,24 @@ func getUnicode(control string) (bool, string) {
 	after := control[buf.Len()+1:]
 	num, _ := strconv.ParseInt(buf.String(), 16, 16)
 	return true, fmt.Sprintf("%c%s", num, after)
+}
+
+func handleParam(r peekingReader.Reader, control string) error {
+	ccontrol, _ := canonicalize(control)
+	if isValue(ccontrol) || isToggle(ccontrol) || isDestination(control) || isFlag(control) { // Skip any parameter
+		_, err := peekingReader.ReadUntilAny(r, []byte{'\\', '{', '}', '\n', '\r', ';'})
+		if err != nil {
+			return err
+		}
+		p, err := r.Peek(1)
+		if err != nil {
+			return err
+		}
+		if p[0] == ';' { // skip next if it is a semicolon
+			r.ReadByte()
+		}
+	}
+	return nil
 }
 
 // canonicalize will return a control word with N in place of any digit
