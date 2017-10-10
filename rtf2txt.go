@@ -2,6 +2,7 @@ package rtf2txt
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -35,18 +36,19 @@ func Text(r io.Reader) (io.Reader, error) {
 }
 
 func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
-	data, err := peekingReader.ReadUntilAny(r, []byte{'\\', '{', '}', '\x00', '\t', '\f', ' ', '\n', '\r'})
+	control, _, err := getControl(r)
 	if err != nil {
 		return err
 	}
-	control := string(data)
 	if control == "*" { // this is an extended control sequence
 		err := readUntilClosingBrace(r)
 		if err != nil {
 			return err
 		}
 		if last := s.Peek(); last != nil {
-			return handleParam(r, *last) // last control was interrupted, so finish handling Params
+			val, err := getParams(r) // last control was interrupted, so finish handling Params
+			handleParams(control, val, text)
+			return err
 		}
 		return nil
 	}
@@ -76,11 +78,56 @@ func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
 		return nil
 	}
 
-	if err := handleParam(r, control); err != nil {
+	val, err := getParams(r)
+	if err != nil {
 		return err
 	}
+	handleParams(control, val, text)
 	s.Push(control)
 	return nil
+}
+
+func getControl(r peekingReader.Reader) (string, int, error) {
+	var buf bytes.Buffer
+	numStart := -1
+	for {
+		p, err := r.Peek(1)
+		if err != nil {
+			return "", -1, err
+		}
+		b := p[0]
+		switch {
+		case b >= '0' && b <= '9' || b == '-':
+			if numStart == -1 {
+				numStart = buf.Len()
+			} else if numStart == 0 {
+				return "", -1, errors.New("Unexpected control sequence. Cannot begin with digit")
+			}
+			buf.WriteByte(b)
+			r.ReadByte() // consume valid digit
+		case b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z':
+			if numStart > 0 { // we've already seen alpha character(s) plus digit(s)
+				c, num := canonicalize(buf.String(), numStart)
+				return c, num, nil
+			}
+			buf.WriteByte(b)
+			r.ReadByte()
+		default:
+			c, num := canonicalize(buf.String(), numStart)
+			return c, num, nil
+		}
+	}
+}
+
+func canonicalize(control string, numStart int) (string, int) {
+	if numStart == -1 || numStart >= len(control) {
+		return control, -1
+	}
+	num, err := strconv.Atoi(control[numStart:])
+	if err != nil {
+		return control, -1
+	}
+	return control[:numStart] + "N", num
 }
 
 func getUnicode(control string) (bool, string) {
@@ -102,36 +149,20 @@ func getUnicode(control string) (bool, string) {
 	return true, fmt.Sprintf("%c%s", num, after)
 }
 
-func handleParam(r peekingReader.Reader, control string) error {
-	ccontrol, _ := canonicalize(control)
-	if isValue(ccontrol) || isToggle(ccontrol) || isDestination(control) || isFlag(control) { // Skip any parameter
-		_, err := peekingReader.ReadUntilAny(r, []byte{'\\', '{', '}', '\n', '\r', ';'})
-		if err != nil {
-			return err
-		}
-		p, err := r.Peek(1)
-		if err != nil {
-			return err
-		}
-		if p[0] == ';' { // skip next if it is a semicolon
-			r.ReadByte()
-		}
+func getParams(r peekingReader.Reader) (string, error) {
+	data, err := peekingReader.ReadUntilAny(r, []byte{'\\', '{', '}', '\n', '\r', ';'})
+	if err != nil {
+		return "", err
 	}
-	return nil
-}
+	p, err := r.Peek(1)
+	if err != nil {
+		return "", err
+	}
+	if p[0] == ';' { // skip next if it is a semicolon
+		r.ReadByte()
+	}
 
-// canonicalize will return a control word with N in place of any digit
-func canonicalize(control string) (string, int) {
-	for i := 0; i < len(control); i++ {
-		if control[i] >= '0' && control[i] <= '9' {
-			num, err := strconv.Atoi(control[i:])
-			if err != nil {
-				return control, -1
-			}
-			return control[:i] + "N", num
-		}
-	}
-	return control, -1
+	return string(data), nil
 }
 
 func handleBinary(r peekingReader.Reader, control string) error {
@@ -173,200 +204,227 @@ func readUntilClosingBrace(r peekingReader.Reader) error {
 	return err
 }
 
-func isDestination(symbol string) bool {
-	switch symbol {
-	case "aftncn", "aftnsep", "aftnsepc", "annotation", "atnauthor", "atndate", "atnicn", "atnid", "atnparent", "atnref", "atntime",
-		"atrfend", "atrfstart", "author", "background", "bkmkend", "bkmkstart", "blipuid", "buptim", "category", "colorschememapping",
-		"colortbl", "comment", "company", "creatim", "datafield ", "datastore", "defchp", "defpap", "do ", "doccomm", "docvar",
-		"dptxbxtext", "ebcend", "ebcstart", "factoidname", "falt ", "fchars", "ffdeftext", "ffentrymcr", "ffexitmcr", "ffformat",
-		"ffhelptext", "ffl", "ffname", "ffstattext", "field", "file ", "filetbl ", "fldinst", "fldrslt", "fname", "fontemb", "fontfile",
-		"fonttbl", "footer", "footerf", "footerl", "footerr", "footnote", "formfield", "ftncn", "ftnsep", "ftnsepc", "g", "generator",
-		"gridtbl", "header", "headerf", "headerl", "headerr", "hl", "hlfr", "hlinkbase", "hlloc", "hlsrc", "hsv", "htmltag", "info",
-		"keycode", "keywords", "latentstyles", "lchars", "levelnumbers", "leveltext", "lfolevel", "linkval", "list", "listlevel",
-		"listname", "listoverride", "listoverridetable", "listpicture", "liststylename", "listtable", "listtext", "lsdlockedexcept",
-		"macc", "maccPr", "mailmerge", "maln", "malnScr", "manager", "margPr", "mbar", "mbarPr", "mbaseJc", "mbegChr", "mborderBox",
-		"mborderBoxPr", "mbox", "mboxPr", "mchr", "mcount", "mctrlPr", "md", "mdeg", "mdegHide", "mden", "mdiff", "mdPr", "me",
-		"mendChr", "meqArr", "meqArrPr", "mf", "mfName", "mfPr", "mfunc", "mfuncPr", "mgroupChr", "mgroupChrPr", "mgrow", "mhideBot",
-		"mhideLeft", "mhideRight", "mhideTop", "mhtmltag", "mlim", "mlimloc", "mlimlow", "mlimlowPr", "mlimupp", "mlimuppPr", "mm",
-		"mmaddfieldname", "mmath", "mmathPict", "mmathPr", "mmaxdist", "mmc", "mmcJc", "mmconnectstr", "mmconnectstrdata", "mmcPr",
-		"mmcs", "mmdatasource", "mmheadersource", "mmmailsubject", "mmodso", "mmodsofilter", "mmodsofldmpdata", "mmodsomappedname",
-		"mmodsoname", "mmodsorecipdata", "mmodsosort", "mmodsosrc ", "mmodsotable", "mmodsoudl", "mmodsoudldata", "mmodsouniquetag",
-		"mmPr", "mmquery", "mmr", "mnary", "mnaryPr", "mnoBreak", "mnum", "mobjDist", "moMath", "moMathPara", "moMathParaPr", "mopEmu",
-		"mphant", "mphantPr", "mplcHide", "mpos", "mr", "mrad", "mradPr", "mrPr", "msepChr", "mshow", "mshp", "msPre", "msPrePr", "msSub",
-		"msSubPr", "msSubSup", "msSubSupPr", "msSup", "msSupPr", "mstrikeBLTR", "mstrikeH", "mstrikeTLBR", "mstrikeV", "msub", "msubHide",
-		"msup", "msupHide", "mtransp", "mtype", "mvertJc", "mvfmf", "mvfml", "mvtof", "mvtol", "mzeroAsc", "mzeroDesc", "mzeroWid",
-		"nesttableprops", "nextfile", "nonesttables", "objalias", "objclass", "objdata", "object", "objname", "objsect", "objtime",
-		"oldcprops", "oldpprops", "oldsprops", "oldtprops", "oleclsid", "operator", "panose", "password", "passwordhash", "pgp", "pgptbl",
-		"picprop", "pict", "pn ", "pntext ", "pntxta ", "pntxtb ", "printim", "private", "propname", "protend", "protstart", "protusertbl",
-		"pxe", "result", "revtbl ", "revtim", "rsidtbl", "rtfN", "rxe", "shp", "shpgrp", "shpinst", "shppict", "shprslt", "shptxt", "sn",
-		"sp", "staticval", "stylesheet", "subject", "sv", "svb", "tc", "template", "themedata", "title", "txe", "ud", "upr", "userprops",
-		"wgrffmtfilter", "windowcaption", "writereservation", "writereservhash", "xe", "xform", "xmlattrname", "xmlattrvalue", "xmlclose",
-		"xmlname", "xmlnstbl", "xmlopen", "fldtype":
-		return true
-	}
-	return false
-}
+func handleParams(control, param string, text *bytes.Buffer) bool {
+	switch control {
+	// Absolution Position Tabs
+	// case "pindtabqc", "pindtabql", "pindtabqr", "pmartabqc", "pmartabql", "pmartabqr", "ptabldot", "ptablmdot", "ptablminus", "ptablnone", "ptabluscore":
 
-func isFlag(symbol string) bool {
-	switch symbol {
-	case "abslock", "additive", "adjustright", "aenddoc", "aendnotes", "afelev", "aftnbj", "aftnnalc", "aftnnar", "aftnnauc", "aftnnchi",
-		"aftnnchosung", "aftnncnum", "aftnndbar", "aftnndbnum", "aftnndbnumd", "aftnndbnumk", "aftnndbnumt", "aftnnganada", "aftnngbnum",
-		"aftnngbnumd", "aftnngbnumk", "aftnngbnuml", "aftnnrlc", "aftnnruc", "aftnnzodiac", "aftnnzodiacd", "aftnnzodiacl", "aftnrestart",
-		"aftnrstcont", "aftntj", "allowfieldendsel", "allprot", "alntblind", "alt", "annotprot", "ansi", "ApplyBrkRules", "asianbrkrule",
-		"autofmtoverride", "bdbfhdr", "bdrrlswsix", "bgbdiag", "bgcross", "bgdcross", "bgdkbdiag", "bgdkcross", "bgdkdcross", "bgdkfdiag",
-		"bgdkhoriz", "bgdkvert", "bgfdiag", "bghoriz", "bgvert", "bkmkpub", "bookfold", "bookfoldrev", "box", "brdrb", "brdrbar", "brdrbtw",
-		"brdrdash", "brdrdashd", "brdrdashdd", "brdrdashdot", "brdrdashdotdot", "brdrdashdotstr", "brdrdashsm", "brdrdb", "brdrdot", "brdremboss",
-		"brdrengrave", "brdrframe", "brdrhair", "brdrinset", "brdrl", "brdrnil", "brdrnone", "brdroutset", "brdrr", "brdrs", "brdrsh",
-		"brdrt", "brdrtbl", "brdrth", "brdrthtnlg", "brdrthtnmg", "brdrthtnsg", "brdrtnthlg", "brdrtnthmg", "brdrtnthsg", "brdrtnthtnlg",
-		"brdrtnthtnmg", "brdrtnthtnsg", "brdrtriple", "brdrwavy", "brdrwavydb", "brkfrm", "bxe", "caccentfive", "caccentfour", "caccentone",
-		"caccentsix", "caccentthree", "caccenttwo", "cachedcolbal", "cbackgroundone", "cbackgroundtwo", "cfollowedhyperlink", "chbgbdiag",
-		"chbgcross", "chbgdcross", "chbgdkbdiag", "chbgdkcross", "chbgdkdcross", "chbgdkfdiag", "chbgdkhoriz", "chbgdkvert", "chbgfdiag",
-		"chbghoriz", "chbgvert", "chbrdr", "chyperlink", "clbgbdiag", "clbgcross", "clbgdcross", "clbgdkbdiag", "clbgdkcross", "clbgdkdcross",
-		"clbgdkfdiag", "clbgdkhor", "clbgdkvert", "clbgfdiag", "clbghoriz", "clbgvert", "clbrdrb", "clbrdrl", "clbrdrr", "clbrdrt", "cldel",
-		"cldgll", "cldglu", "clFitText", "clhidemark", "clins", "clmgf", "clmrg", "clmrgd", "clmrgdr", "clNoWrap", "clshdrawnil", "clsplit",
-		"clsplitr", "cltxbtlr", "cltxlrtb", "cltxlrtbv", "cltxtbrl", "cltxtbrlv", "clvertalb", "clvertalc", "clvertalt", "clvmgf", "clvmrg",
-		"cmaindarkone", "cmaindarktwo", "cmainlightone", "cmainlighttwo", "collapsed", "contextualspace", "ctextone", "ctexttwo", "ctrl",
-		"cvmme", "dbch", "defformat", "defshp", "dgmargin", "dgsnap", "dntblnsbdb", "dobxcolumn", "dobxmargin", "dobxpage", "dobymargin",
-		"dobypage", "dobypara", "doctemp", "dolock", "donotshowcomments", "donotshowinsdel", "donotshowmarkup", "donotshowprops", "dpaendhol",
-		"dpaendsol", "dparc", "dparcflipx", "dparcflipy", "dpastarthol", "dpastartsol", "dpcallout", "dpcoaccent", "dpcobestfit", "dpcoborder",
-		"dpcodabs", "dpcodbottom", "dpcodcenter", "dpcodtop", "dpcominusx", "dpcominusy", "dpcosmarta", "dpcotdouble", "dpcotright",
-		"dpcotsingle", "dpcottriple", "dpellipse", "dpendgroup", "dpfillbgpal", "dpfillfgpal", "dpgroup", "dpline", "dplinedado",
-		"dplinedadodo", "dplinedash", "dplinedot", "dplinehollow", "dplinepal", "dplinesolid", "dppolygon", "dppolyline", "dprect",
-		"dproundr", "dpshadow", "dptxbtlr", "dptxbx", "dptxlrtb", "dptxlrtbv", "dptxtbrl", "dptxtbrlv", "emfblip", "enddoc", "endnhere",
-		"endnotes", "expshrtn", "faauto", "facenter", "facingp", "fafixed", "fahang", "faroman", "favar", "fbidi", "fbidis", "fbimajor",
-		"fbiminor", "fdbmajor", "fdbminor", "fdecor", "felnbrelev", "fetch", "fhimajor", "fhiminor", "fjgothic", "fjminchou", "fldalt",
-		"flddirty", "fldedit", "fldlock", "fldpriv", "flomajor", "flominor", "fmodern", "fnetwork", "fnil", "fnonfilesys", "forceupgrade",
-		"formdisp", "formprot", "formshade", "fracwidth", "frmtxbtlr", "frmtxlrtb", "frmtxlrtbv", "frmtxtbrl", "frmtxtbrlv", "froman",
-		"fromtext", "fscript", "fswiss", "ftech", "ftnalt", "ftnbj", "ftnil", "ftnlytwnine", "ftnnalc", "ftnnar", "ftnnauc", "ftnnchi",
-		"ftnnchosung", "ftnncnum", "ftnndbar", "ftnndbnum", "ftnndbnumd", "ftnndbnumk", "ftnndbnumt", "ftnnganada", "ftnngbnum", "ftnngbnumd",
-		"ftnngbnumk", "ftnngbnuml", "ftnnrlc", "ftnnruc", "ftnnzodiac", "ftnnzodiacd", "ftnnzodiacl", "ftnrestart", "ftnrstcont", "ftnrstpg",
-		"ftntj", "fttruetype", "fvaliddos", "fvalidhpfs", "fvalidmac", "fvalidntfs", "gutterprl", "hich", "horzdoc", "horzsect", "hrule",
-		"htmautsp", "htmlbase", "hwelev", "indmirror", "indrlsweleven", "intbl", "ixe", "jclisttab", "jcompress", "jexpand", "jis",
-		"jpegblip", "jsksu", "keep", "keepn", "krnprsnet", "landscape", "lastrow", "levelpicturenosize", "linebetcol", "linecont", "lineppage",
-		"linerestart", "linkself", "linkstyles", "listhybrid", "listoverridestartat", "lnbrkrule", "lndscpsxn", "lnongrid", "loch", "ltrch",
-		"ltrdoc", "ltrpar", "ltrrow", "ltrsect", "lvltentative", "lytcalctblwd", "lytexcttp", "lytprtmet", "lyttblrtgr", "mac", "macpict",
-		"makebackup", "margmirror", "margmirsxn", "mmattach", "mmblanklines", "mmdatatypeaccess", "mmdatatypeexcel", "mmdatatypefile",
-		"mmdatatypeodbc", "mmdatatypeodso", "mmdatatypeqt", "mmdefaultsql", "mmdestemail", "mmdestfax", "mmdestnewdoc", "mmdestprinter",
-		"mmlinktoquery", "mmmaintypecatalog", "mmmaintypeemail", "mmmaintypeenvelopes", "mmmaintypefax", "mmmaintypelabels",
-		"mmmaintypeletters", "mmshowdata", "msmcap", "muser", "mvf", "mvt", "newtblstyruls", "noafcnsttbl", "nobrkwrptbl", "nocolbal",
-		"nocompatoptions", "nocwrap", "nocxsptable", "noextrasprl", "nofeaturethrottle", "nogrowautofit", "noindnmbrts", "nojkernpunct",
-		"nolead", "noline", "nolnhtadjtbl", "nonshppict", "nooverflow", "noproof", "noqfpromote", "nosectexpand", "nosnaplinegrid",
-		"nospaceforul", "nosupersub", "notabind", "notbrkcnstfrctbl", "notcvasp", "notvatxbx", "nouicompat", "noultrlspc", "nowidctlpar",
-		"nowrap", "nowwrap", "noxlattoyen", "objattph", "objautlink", "objemb", "objhtml", "objicemb", "objlink", "objlock", "objocx",
-		"objpub", "objsetsize", "objsub", "objupdate", "oldas", "oldlinewrap", "otblrul", "overlay", "pagebb", "pard", "pc", "pca",
-		"pgbrdrb", "pgbrdrfoot", "pgbrdrhead", "pgbrdrl", "pgbrdrr", "pgbrdrsnap", "pgbrdrt", "pgnbidia", "pgnbidib", "pgnchosung",
-		"pgncnum", "pgncont", "pgndbnum", "pgndbnumd", "pgndbnumk", "pgndbnumt", "pgndec", "pgndecd", "pgnganada", "pgngbnum",
-		"pgngbnumd", "pgngbnumk", "pgngbnuml", "pgnhindia", "pgnhindib", "pgnhindic", "pgnhindid", "pgnhnsc", "pgnhnsh", "pgnhnsm",
-		"pgnhnsn", "pgnhnsp", "pgnid", "pgnlcltr", "pgnlcrm", "pgnrestart", "pgnthaia", "pgnthaib", "pgnthaic", "pgnucltr", "pgnucrm",
-		"pgnvieta", "pgnzodiac", "pgnzodiacd", "pgnzodiacl", "phcol", "phmrg", "phpg", "picbmp", "picscaled", "pindtabqc", "pindtabql",
-		"pindtabqr", "plain", "pmartabqc", "pmartabql", "pmartabqr", "pnacross", "pnaiu", "pnaiud", "pnaiueo", "pnaiueod", "pnbidia", "pnbidib",
-		"pncard", "pnchosung", "pncnum", "pndbnum", "pndbnumd", "pndbnumk", "pndbnuml", "pndbnumt", "pndec", "pndecd", "pnganada", "pngblip",
-		"pngbnum", "pngbnumd", "pngbnumk", "pngbnuml", "pnhang", "pniroha", "pnirohad", "pnlcltr", "pnlcrm", "pnlvlblt", "pnlvlbody",
-		"pnlvlcont", "pnnumonce", "pnord", "pnordt", "pnprev", "pnqc", "pnql", "pnqr", "pnrestart", "pnrnot", "pnucltr", "pnucrm", "pnuld",
-		"pnuldash", "pnuldashd", "pnuldashdd", "pnuldb", "pnulhair", "pnulnone", "pnulth", "pnulw", "pnulwave", "pnzodiac", "pnzodiacd",
-		"pnzodiacl", "posxc", "posxi", "posxl", "posxo", "posxr", "posyb", "posyc", "posyil", "posyin", "posyout", "posyt", "prcolbl",
-		"printdata", "psover", "ptabldot", "ptablmdot", "ptablminus", "ptablnone", "ptabluscore", "pubauto", "pvmrg", "pvpara", "pvpg", "qc",
-		"qd", "qj", "ql", "qr", "qt", "rawclbgbdiag", "rawclbgcross", "rawclbgdcross", "rawclbgdkbdiag", "rawclbgdkcross", "rawclbgdkdcross",
-		"rawclbgdkfdiag", "rawclbgdkhor", "rawclbgdkvert", "rawclbgfdiag", "rawclbghoriz", "rawclbgvert", "readonlyrecommended", "readprot",
-		"remdttm", "rempersonalinfo", "revisions", "revprot", "rsltbmp", "rslthtml", "rsltmerge", "rsltpict", "rsltrtf", "rslttxt", "rtlch",
-		"rtldoc", "rtlgutter", "rtlpar", "rtlrow", "rtlsect", "saftnnalc", "saftnnar", "saftnnauc", "saftnnchi", "saftnnchosung", "saftnncnum",
-		"saftnndbar", "saftnndbnum", "saftnndbnumd", "saftnndbnumk", "saftnndbnumt", "saftnnganada", "saftnngbnum", "saftnngbnumd",
-		"saftnngbnumk", "saftnngbnuml", "saftnnrlc", "saftnnruc", "saftnnzodiac", "saftnnzodiacd", "saftnnzodiacl", "saftnrestart",
-		"saftnrstcont", "sautoupd", "saveinvalidxml", "saveprevpict", "sbkcol", "sbkeven", "sbknone", "sbkodd", "sbkpage", "sbys",
-		"scompose", "sectd", "sectdefaultcl", "sectspecifycl", "sectspecifygenN", "sectspecifyl", "sectunlocked", "sftnbj", "sftnnalc",
-		"sftnnar", "sftnnauc", "sftnnchi", "sftnnchosung", "sftnncnum", "sftnndbar", "sftnndbnum", "sftnndbnumd", "sftnndbnumk", "sftnndbnumt",
-		"sftnnganada", "sftnngbnum", "sftnngbnumd", "sftnngbnumk", "sftnngbnuml", "sftnnrlc", "sftnnruc", "sftnnzodiac", "sftnnzodiacd",
-		"sftnnzodiacl", "sftnrestart", "sftnrstcont", "sftnrstpg", "sftntj", "shidden", "shift", "shpbxcolumn", "shpbxignore", "shpbxmargin",
-		"shpbxpage", "shpbyignore", "shpbymargin", "shpbypage", "shpbypara", "shplockanchor", "slocked", "snaptogridincell", "softcol",
-		"softline", "softpage", "spersonal", "spltpgpar", "splytwnine", "sprsbsp", "sprslnsp", "sprsspbf", "sprstsm", "sprstsp", "spv",
-		"sqformat", "sreply", "stylelock", "stylelockbackcomp", "stylelockenforced", "stylelockqfset", "stylelocktheme", "sub",
-		"subfontbysize", "super", "swpbdr", "tabsnoovrlp", "taprtl", "tbllkbestfit", "tbllkborder", "tbllkcolor", "tbllkfont", "tbllkhdrcols",
-		"tbllkhdrrows", "tbllklastcol", "tbllklastrow", "tbllknocolband", "tbllknorowband", "tbllkshading", "tcelld", "tcn", "titlepg",
-		"tldot", "tleq", "tlhyph", "tlmdot", "tlth", "tlul", "toplinepunct", "tphcol", "tphmrg", "tphpg", "tposxc", "tposxi", "tposxl",
-		"tposxo", "tposxr", "tposyb", "tposyc", "tposyil", "tposyin", "tposyout", "tposyt", "tpvmrg", "tpvpara", "tpvpg", "tqc", "tqdec",
-		"tqr", "transmf", "trbgbdiag", "trbgcross", "trbgdcross", "trbgdkbdiag", "trbgdkcross", "trbgdkdcross", "trbgdkfdiag", "trbgdkhor",
-		"trbgdkvert", "trbgfdiag", "trbghoriz", "trbgvert", "trbrdrb", "trbrdrh", "trbrdrl", "trbrdrr", "trbrdrt", "trbrdrv", "trhdr",
-		"trkeep", "trkeepfollow", "trowd", "trqc", "trql", "trqr", "truncatefontheight", "truncex", "tsbgbdiag", "tsbgcross", "tsbgdcross",
-		"tsbgdkbdiag", "tsbgdkcross", "tsbgdkdcross", "tsbgdkfdiag", "tsbgdkhor", "tsbgdkvert", "tsbgfdiag", "tsbghoriz", "tsbgvert",
-		"tsbrdrb", "tsbrdrdgl", "tsbrdrdgr", "tsbrdrh", "tsbrdrl", "tsbrdrr", "tsbrdrt", "tsbrdrv", "tscbandhorzeven",
-		"tscbandhorzodd", "tscbandverteven", "tscbandvertodd", "tscfirstcol", "tscfirstrow", "tsclastcol", "tsclastrow", "tscnecell",
-		"tscnwcell", "tscsecell", "tscswcell", "tsd", "tsnowrap", "tsrowd", "tsvertalb", "tsvertalc", "tsvertalt", "twoonone",
-		"txbxtwalways", "txbxtwfirst", "txbxtwfirstlast", "txbxtwlast", "txbxtwno", "uld", "ulnone", "ulw", "useltbaln", "usenormstyforlist",
-		"usexform", "utinl", "vertal", "vertalb", "vertalc", "vertalj", "vertalt", "vertdoc", "vertsect", "viewnobound", "webhidden",
-		"widctlpar", "widowctrl", "wpjst", "wpsp", "wraparound", "wrapdefault", "wrapthrough", "wraptight", "wraptrsp", "wrppunct",
-		"xmlattr", "xmlsdttcell", "xmlsdttpara", "xmlsdttregular", "xmlsdttrow", "xmlsdttunknown", "yxe", "mlit", "mmfttypeaddress",
-		"mmfttypebarcode", "mmfttypedbcolumn", "mmfttypemapped", "mmfttypenull", "mmfttypesalutation", "mnor", "date", "time", "wpeqn":
-		return true
-	}
-	return false
-}
+	// Associated Character Properties
+	// case "ab","acaps","acfN","adnN","aexpndN","afN","afsN","ai","alangN","aoutl","ascaps","ashad","astrike","aul","auld","auldb","aulnone","aulw","aupN","dbch","fcsN","hich","loch":
 
-func isToggle(symbol string) bool {
-	switch symbol {
-	case "ab", "absnoovrlpN", "acaps", "acccircle", "acccomma", "accdot", "accnone", "accunderdot", "ai", "aoutl", "ascaps", "ashad",
-		"aspalpha", "aspnum", "astrike", "aul", "auld", "auldb", "aulnone", "aulw", "b", "caps", "deleted", "disabled", "embo", "htmlrtf",
-		"hyphauto", "hyphcaps", "hyphpar", "i", "impr", "outl", "pnb", "pncaps", "pni", "pnscaps", "pnstrike", "pnul", "protect", "revised",
-		"saautoN", "sbautoN", "scaps", "shad", "strike", "striked1", "trautofitN", "ul", "uldash", "uldashd", "uldashdd", "uldb", "ulhair",
-		"ulhwave", "ulldash", "ulth", "ulthd", "ulthdash", "ulthdashd", "ulthdashdd", "ulthldash", "ululdbwave", "ulwave", "v":
-		return true
-	}
-	return false
-}
+	// Bookmarks
+	// case "bkmkcolfN","bkmkcollN","bkmkend","bkmkstart":
 
-func isValue(symbol string) bool {
-	switch symbol {
-	case "abshN", "abswN", "acfN", "adeffN", "adeflangN", "adnN", "aexpndN", "afN", "afsN", "aftnstartN", "alangN", "animtextN",
-		"ansicpgN", "aupN", "binfsxnN", "binN", "binsxnN", "bkmkcolfN", "bkmkcollN", "bliptagN", "blipupiN", "blueN", "bookfoldsheetsN",
-		"brdrartN", "brdrcfN", "brdrwN", "brspN", "cbN", "cbpatN", "cchsN", "cellxN", "cfN", "cfpatN", "cgridN", "charrsidN", "charscalexN",
-		"chcbpatN", "chcfpatN", "chhresN", "chshdngN", "clcbpatN", "clcbpatrawN", "clcfpatN", "clcfpatrawN", "cldelauthN", "cldeldttmN",
-		"clftsWidthN", "clinsauthN", "clinsdttmN", "clmrgdauthN", "clmrgddttmN", "clpadbN", "clpadfbN", "clpadflN", "clpadfrN", "clpadftN",
-		"clpadlN", "clpadrN", "clpadtN", "clshdngN", "clshdngrawN", "clspbN", "clspfbN", "clspflN", "clspfrN", "clspftN", "clsplN",
-		"clsprN", "clsptN", "clwWidthN", "colnoN", "colsN", "colsrN", "colsxN", "colwN", "cpgN", "crauthN", "crdateN", "cshadeN", "csN",
-		"ctintN", "ctsN", "cufiN", "culiN", "curiN", "deffN", "deflangfeN", "deflangN", "deftabN", "delrsidN", "dfrauthN", "dfrdateN",
-		"dfrmtxtxN", "dfrmtxtyN", "dfrstart", "dfrstop", "dfrxst", "dghoriginN", "dghshowN", "dghspaceN", "dgvoriginN", "dgvshowN",
-		"dgvspaceN", "dibitmapN", "dnN", "doctypeN", "dodhgtN", "donotembedlingdataN", "donotembedsysfontN", "dpaendlN", "dpaendwN",
-		"dpastartlN", "dpastartwN", "dpcoaN", "dpcodescentN", "dpcolengthN", "dpcooffsetN", "dpcountN", "dpfillbgcbN", "dpfillbgcgN",
-		"dpfillbgcrN", "dpfillbggrayN", "dpfillfgcbN", "dpfillfgcgN", "dpfillfgcrN", "dpfillfggrayN", "dpfillpatN", "dplinecobN",
-		"dplinecogN", "dplinecorN", "dplinegrayN", "dplinewN", "dppolycountN", "dpptxN", "dpptyN", "dpshadxN", "dpshadyN", "dptxbxmarN",
-		"dpxN", "dpxsizeN", "dpyN", "dpysizeN", "dropcapliN", "dropcaptN", "dsN", "dxfrtextN", "dyN", "edminsN", "enforceprotN", "expndN",
-		"expndtwN", "fbiasN", "fcharsetN", "fcsN", "fetN", "ffdefresN", "ffhaslistboxN", "ffhpsN", "ffmaxlenN", "ffownhelpN", "ffownstatN",
-		"ffprotN", "ffrecalcN", "ffresN", "ffsizeN", "fftypeN", "fftypetxtN", "fidN", "fiN", "fittextN", "fN", "fnN", "footeryN", "fosnumN",
-		"fprqN", "frelativeN", "fromhtmlN", "fsN", "ftnstartN", "gcwN", "greenN", "grfdoceventsN", "gutterN", "guttersxnN", "headeryN",
-		"highlightN", "horzvertN", "hresN", "hrN", "hyphconsecN", "hyphhotzN", "idN", "ignoremixedcontentN", "ilfomacatclnupN", "ilvlN",
-		"insrsidN", "ipgpN", "irowbandN", "irowN", "itapN", "kerningN", "ksulangN", "langfeN", "langfenpN", "langN", "langnpN", "lbrN",
-		"levelfollowN", "levelindentN", "leveljcN", "leveljcnN", "levellegalN", "levelN", "levelnfcN", "levelnfcnN", "levelnorestartN",
-		"leveloldN", "levelpictureN", "levelprevN", "levelprevspaceN", "levelspaceN", "levelstartatN", "leveltemplateidN", "liN", "linemodN",
-		"linestartN", "linestartsN", "linexN", "linN", "lisaN", "lisbN", "listidN", "listoverridecountN", "listoverrideformatN",
-		"listrestarthdnN", "listsimpleN", "liststyleidN", "listtemplateidN", "lsdlockeddefN", "lsdlockedN", "lsdprioritydefN", "lsdpriorityN",
-		"lsdqformatdefN", "lsdqformatN", "lsdsemihiddendefN", "lsdsemihiddenN", "lsdstimaxN", "lsdunhideuseddefN", "lsdunhideusedN",
-		"lsN", "margbN", "margbsxnN", "marglN", "marglsxnN", "margrN", "margrsxnN", "margSzN", "margtN", "margtsxnN", "mbrkBinN",
-		"mbrkBinSubN", "mbrkN", "mcGpN", "mcGpRuleN", "mcSpN", "mdefJcN", "mdiffStyN", "mdispdefN", "minN", "minterSpN", "mintLimN",
-		"mintraSpN", "mjcN", "mlMarginN", "mmathFontN", "mmerrorsN", "mmjdsotypeN", "mmodsoactiveN", "mmodsocoldelimN", "mmodsocolumnN",
-		"mmodsodynaddrN", "mmodsofhdrN", "mmodsofmcolumnN", "mmodsohashN", "mmodsolidN", "mmreccurN", "mnaryLimN", "moN", "mpostSpN",
-		"mpreSpN", "mrMarginN", "mrSpN", "mrSpRuleN", "mscrN", "msmallFracN", "mstyN", "mvauthN", "mvdateN", "mwrapIndentN", "mwrapRightN",
-		"nofcharsN", "nofcharswsN", "nofpagesN", "nofwordsN", "objalignN", "objcropbN", "objcroplN", "objcroprN", "objcroptN", "objhN",
-		"objscalexN", "objscaleyN", "objtransyN", "objwN", "ogutterN", "outlinelevelN", "paperhN", "paperwN", "pararsidN", "pgbrdroptN",
-		"pghsxnN", "pgnhnN", "pgnstartN", "pgnstartsN", "pgnxN", "pgnyN", "pgwsxnN", "picbppN", "piccropbN", "piccroplN", "piccroprN",
-		"piccroptN", "pichgoalN", "pichN", "picscalexN", "picscaleyN", "picwgoalN", "picwN", "pmmetafileN", "pncfN", "pnfN", "pnfsN",
-		"pnindentN", "pnlvlN", "pnrauthN", "pnrdateN", "pnrnfcN", "pnrpnbrN", "pnrrgbN", "pnrstartN", "pnrstopN", "pnrxstN", "pnspN",
-		"pnstartN", "posnegxN", "posnegyN", "posxN", "posyN", "prauthN", "prdateN", "proptypeN", "protlevelN", "pszN", "pwdN", "qkN", "redN",
-		"relyonvmlN", "revauthdelN", "revauthN", "revbarN", "revdttmdelN", "revdttmN", "revpropN", "riN", "rinN", "rsidN", "rsidrootN",
-		"saftnstartN", "saN", "sbasedonN", "sbN", "secN", "sectexpandN", "sectlinegridN", "sectrsidN", "sftnstartN", "shadingN",
-		"showplaceholdtextN", "showxmlerrorsN", "shpbottomN", "shpfblwtxtN", "shpfhdrN", "shpleftN", "shplidN", "shprightN", "shptopN",
-		"shpwrkN", "shpwrN", "shpzN", "slinkN", "slmultN", "slN", "sN", "snextN", "softlheightN", "spriorityN", "srauthN", "srdateN",
-		"ssemihiddenN", "stextflowN", "stshfbiN", "stshfdbchN", "stshfhichN", "stshflochN", "stylesortmethodN", "styrsidN", "subdocumentN",
-		"sunhideusedN", "tblindN", "tblindtypeN", "tblrsidN", "tbN", "tcfN", "tclN", "tdfrmtxtBottomN", "tdfrmtxtLeftN", "tdfrmtxtRightN",
-		"tdfrmtxtTopN", "themelangcsN", "themelangfeN", "themelangN", "tposnegxN", "tposnegyN", "tposxN", "tposyN", "trackformattingN",
-		"trackmovesN", "trauthN", "trcbpatN", "trcfpatN", "trdateN", "trftsWidthAN", "trftsWidthBN", "trftsWidthN", "trgaphN", "trleftN",
-		"trpaddbN", "trpaddfbN", "trpaddflN", "trpaddfrN", "trpaddftN", "trpaddlN", "trpaddrN", "trpaddtN", "trpadobN", "trpadofbN",
-		"trpadoflN", "trpadofrN", "trpadoftN", "trpadolN", "trpadorN", "trpadotN", "trpatN", "trrhN", "trshdngN", "trspdbN", "trspdfbN",
-		"trspdflN", "trspdfrN", "trspdftN", "trspdlN", "trspdrN", "trspdtN", "trspobN", "trspofbN", "trspoflN", "trspofrN", "trspoftN",
-		"trspolN", "trsporN", "trspotN", "trwWidthAN", "trwWidthBN", "trwWidthN", "tscbandshN", "tscbandsvN", "tscellcbpatN", "tscellcfpatN",
-		"tscellpaddbN", "tscellpaddfbN", "tscellpaddflN", "tscellpaddfrN", "tscellpaddftN", "tscellpaddlN", "tscellpaddrN", "tscellpaddtN",
-		"tscellpctN", "tscellwidthftsN", "tscellwidthN", "tsN", "twoinoneN", "txN", "ucN", "ulcN", "uN", "upN", "urtfN", "validatexmlN",
-		"vernN", "versionN", "viewbkspN", "viewkindN", "viewscaleN", "viewzkN", "wbitmapN", "wbmbitspixelN", "wbmplanesN", "wbmwidthbyteN",
-		"wmetafileN", "xefN", "xmlattrnsN", "xmlnsN", "yrN", "ytsN":
-		return true
+	// Bullets and Numbering
+	// case "ilvlN","listtext","pn ","pnacross ","pnaiu","pnaiud","pnaiueo","pnaiueod","pnb ","pnbidia","pnbidib","pncaps ","pncard ","pncfN ","pnchosung","pncnum","pndbnum","pndbnumd","pndbnumk","pndbnuml","pndbnumt","pndec ","pndecd","pnfN ","pnfsN ","pnganada","pngbnum","pngbnumd","pngbnumk","pngbnuml","pnhang ","pni ","pnindentN ","pniroha","pnirohad","pnlcltr ","pnlcrm ","pnlvlblt ","pnlvlbody ","pnlvlcont ","pnlvlN ","pnnumonce ","pnord ","pnordt ","pnprev ","pnqc ","pnql ","pnqr ","pnrestart ","pnscaps ","pnspN ","pnstartN ","pnstrike ","pntext ","pntxta ","pntxtb ","pnucltr ","pnucrm ","pnul ","pnuld ","pnuldash","pnuldashd","pnuldashdd","pnuldb ","pnulhair","pnulnone ","pnulth","pnulw ","pnulwave","pnzodiac","pnzodiacd","pnzodiacl":
+
+	// Character Borders and Shading
+	// case "chbgbdiag","chbgcross","chbgdcross","chbgdkbdiag","chbgdkcross","chbgdkdcross","chbgdkfdiag","chbgdkhoriz","chbgdkvert","chbgfdiag","chbghoriz","chbgvert","chbrdr","chcbpatN","chcfpatN","chshdngN":
+
+	// Character Revision Mark Properties
+	// case "crauthN","crdateN","deleted","mvauthN ","mvdateN ","mvf","mvt","revauthdelN","revauthN ","revdttmdelN","revdttmN ","revised":
+
+	// Character Set
+	// case "ansi","ansicpgN","fbidis","mac","pc","pca","impr","striked1":
+
+	// Code Page Support
+	// case "cpgN":
+
+	// Color Scheme Mapping
+	// case "colorschememapping":
+
+	// Color Table
+	// case "blueN","caccentfive","caccentfour","caccentone","caccentsix","caccentthree","caccenttwo","cbackgroundone","cbackgroundtwo","cfollowedhyperlink","chyperlink","cmaindarkone","cmaindarktwo","cmainlightone","cmainlighttwo","colortbl","cshadeN","ctextone","ctexttwo","ctintN","greenN","redN":
+
+	// Comments (Annotations)
+	// case "annotation","atnauthor","atndate ","atnicn","atnid","atnparent","atnref ","atntime","atrfend ","atrfstart ":
+
+	// Control Words Introduced by Other Microsoft Products
+	// case "disabled","htmlbase ","htmlrtf","htmltag","mhtmltag","protect","pwdN","urtfN":
+
+	// Custom XML Data Properties
+	// case "datastore":
+
+	// Custom XML Tags
+	// case "xmlattr","xmlattrname","xmlattrnsN","xmlattrvalue","xmlclose","xmlname","xmlnstbl","xmlopen","xmlsdttcell","xmlsdttpara","xmlsdttregular","xmlsdttrow","xmlsdttunknown","xmlnsN":
+
+	// Default Fonts
+	// case "adeffN","adeflangN","deffN","deflangfeN","deflangN","stshfbiN","stshfdbchN","stshfhichN","stshflochN":
+
+	// Default Properties
+	// case "defchp","defpap":
+
+	// Document Formatting Properties
+	// case "aenddoc","aendnotes","afelev","aftnbj","aftncn","aftnnalc","aftnnar","aftnnauc","aftnnchi","aftnnchosung","aftnncnum","aftnndbar","aftnndbnum","aftnndbnumd","aftnndbnumk","aftnndbnumt","aftnnganada","aftnngbnum","aftnngbnumd","aftnngbnumk","aftnngbnuml","aftnnrlc ","aftnnruc ","aftnnzodiac","aftnnzodiacd","aftnnzodiacl","aftnrestart ","aftnrstcont ","aftnsep ","aftnsepc ","aftnstartN","aftntj ","allowfieldendsel","allprot ","alntblind","annotprot ","ApplyBrkRules","asianbrkrule","autofmtoverride","background","bdbfhdr","bdrrlswsix","bookfold","bookfoldrev","bookfoldsheetsN","brdrartN","brkfrm ","cachedcolbal","ctsN","cvmme ","defformat","deftabN","dghoriginN","dghshowN","dghspaceN","dgmargin","dgsnap","dgvoriginN","dgvshowN","dgvspaceN","dntblnsbdb","doctemp","doctypeN","donotembedlingdataN","donotembedsysfontN","donotshowcomments","donotshowinsdel","donotshowmarkup","donotshowprops","enddoc","endnotes","enforceprotN","expshrtn","facingp","fchars","felnbrelev","fetN ","forceupgrade","formdisp ","formprot ","formshade ","fracwidth","fromhtmlN","fromtext","ftnalt ","ftnbj","ftncn","ftnlytwnine","ftnnalc ","ftnnar ","ftnnauc ","ftnnchi ","ftnnchosung","ftnncnum","ftnndbar","ftnndbnum","ftnndbnumd","ftnndbnumk","ftnndbnumt","ftnnganada","ftnngbnum","ftnngbnumd","ftnngbnumk","ftnngbnuml","ftnnrlc ","ftnnruc ","ftnnzodiac","ftnnzodiacd","ftnnzodiacl","ftnrestart","ftnrstcont ","ftnrstpg ","ftnsep","ftnsepc","ftnstartN","ftntj","grfdoceventsN","gutterN","gutterprl","horzdoc","htmautsp","hwelev2007","hyphauto ","hyphcaps ","hyphconsecN ","hyphhotzN","ignoremixedcontentN","ilfomacatclnupN","indrlsweleven","jcompress","jexpand","jsksu","krnprsnet","ksulangN","landscape","lchars","linestartN","linkstyles ","lnbrkrule","lnongrid","ltrdoc","lytcalctblwd","lytexcttp","lytprtmet","lyttblrtgr","makebackup","margbN","marglN","margmirror","margrN","margtN","msmcap","muser","newtblstyruls","nextfile","noafcnsttbl","nobrkwrptbl","nocolbal ","nocompatoptions","nocxsptable","noextrasprl ","nofeaturethrottle","nogrowautofit","noindnmbrts","nojkernpunct","nolead","nolnhtadjtbl","nospaceforul","notabind ","notbrkcnstfrctbl","notcvasp","notvatxbx","nouicompat","noultrlspc","noxlattoyen","ogutterN","oldas","oldlinewrap","otblrul ","paperhN","paperwN","pgbrdrb","pgbrdrfoot","pgbrdrhead","pgbrdrl","pgbrdroptN","pgbrdrr","pgbrdrsnap","pgbrdrt","pgnstartN","prcolbl ","printdata ","private","protlevelN","psover","pszN ","readonlyrecommended","readprot","relyonvmlN","remdttm","rempersonalinfo","revbarN","revisions","revpropN","revprot ","rtldoc","rtlgutter","saveinvalidxml","saveprevpict","showplaceholdtextN","showxmlerrorsN","snaptogridincell","spltpgpar","splytwnine","sprsbsp","sprslnsp","sprsspbf ","sprstsm","sprstsp ","stylelock","stylelockbackcomp","stylelockenforced","stylelockqfset","stylelocktheme","stylesortmethodN","subfontbysize","swpbdr ","template","themelangcsN","themelangfeN","themelangN","toplinepunct","trackformattingN","trackmovesN","transmf ","truncatefontheight","truncex","tsd","twoonone","useltbaln","usenormstyforlist","usexform","utinl","validatexmlN","vertdoc","viewbkspN","viewkindN","viewnobound","viewscaleN","viewzkN","wgrffmtfilter","widowctrl","windowcaption","wpjst","wpsp","wraptrsp ","writereservation","writereservhash","wrppunct","xform":
+
+	// Document Variables
+	// case "docvar":
+
+	// Drawing Object Properties
+	// case "hl","hlfr","hlloc","hlsrc","hrule","hsv":
+
+	// Drawing Objects
+	// case "do ","dobxcolumn ","dobxmargin ","dobxpage ","dobymargin ","dobypage ","dobypara ","dodhgtN ","dolock ","dpaendhol ","dpaendlN ","dpaendsol ","dpaendwN ","dparc ","dparcflipx ","dparcflipy ","dpastarthol ","dpastartlN ","dpastartsol ","dpastartwN ","dpcallout ","dpcoaccent ","dpcoaN ","dpcobestfit ","dpcoborder ","dpcodabs","dpcodbottom ","dpcodcenter ","dpcodescentN","dpcodtop ","dpcolengthN ","dpcominusx ","dpcominusy ","dpcooffsetN ","dpcosmarta ","dpcotdouble ","dpcotright ","dpcotsingle ","dpcottriple ","dpcountN ","dpellipse ","dpendgroup ","dpfillbgcbN ","dpfillbgcgN ","dpfillbgcrN ","dpfillbggrayN ","dpfillbgpal ","dpfillfgcbN ","dpfillfgcgN ","dpfillfgcrN ","dpfillfggrayN ","dpfillfgpal ","dpfillpatN ","dpgroup ","dpline ","dplinecobN ","dplinecogN ","dplinecorN ","dplinedado ","dplinedadodo ","dplinedash ","dplinedot ","dplinegrayN ","dplinehollow ","dplinepal ","dplinesolid ","dplinewN ","dppolycountN ","dppolygon ","dppolyline ","dpptxN ","dpptyN ","dprect ","dproundr ","dpshadow ","dpshadxN ","dpshadyN ","dptxbtlr","dptxbx ","dptxbxmarN ","dptxbxtext ","dptxlrtb","dptxlrtbv","dptxtbrl","dptxtbrlv","dpxN ","dpxsizeN ","dpyN ","dpysizeN ":
+
+	// East Asian Control Words
+	// case "cgridN","g","gcwN","gridtbl","nosectexpand","ulhair":
+
+	// Fields
+	// case "datafield ","date","field","fldalt ","flddirty","fldedit","fldinst","fldlock","fldpriv","fldrslt","fldtype","time","wpeqn":
+	case "fldrslt":
+		text.WriteString(param)
+
+	// File Table
+	// case "fidN ","file ","filetbl ","fnetwork ","fnonfilesys","fosnumN ","frelativeN ","fvaliddos ","fvalidhpfs ","fvalidmac ","fvalidntfs ":
+
+	// Font (Character) Formatting Properties
+	case "acccircle", "acccomma", "accdot", "accnone", "accunderdot", "animtextN", "b", "caps", "cbN", "cchsN ", "cfN", "charscalexN", "csN", "dnN", "embo", "expndN", "expndtwN ", "fittextN", "fN", "fsN", "i", "kerningN ", "langfeN", "langfenpN", "langN", "langnpN", "ltrch", "noproof", "nosupersub ", "outl", "plain", "rtlch", "scaps", "shad", "strike", "sub ", "super ", "ul", "ulcN", "uld", "uldash", "uldashd", "uldashdd", "uldb", "ulhwave", "ulldash", "ulnone", "ulth", "ulthd", "ulthdash", "ulthdashd", "ulthdashdd", "ulthldash", "ululdbwave", "ulw", "ulwave", "upN", "v", "webhidden":
+		text.WriteString(param)
+
+	// Font Family
+	// case "fjgothic","fjminchou","jis","falt ","fbiasN","fbidi","fcharsetN","fdecor","fetch","fmodern","fname","fnil","fontemb","fontfile","fonttbl","fprqN ","froman","fscript","fswiss","ftech","ftnil","fttruetype","panose":
+
+	// Footnotes
+	// case "footnote":
+
+	// Form Fields
+	// case "ffdefresN","ffdeftext","ffentrymcr","ffexitmcr","ffformat","ffhaslistboxN","ffhelptext","ffhpsN","ffl","ffmaxlenN","ffname","ffownhelpN","ffownstatN","ffprotN","ffrecalcN","ffresN","ffsizeN","ffstattext","fftypeN","fftypetxtN","formfield":
+
+	// Generator
+	// case "generator":
+
+	// Headers and Footers
+	// case "footer","footerf","footerl","footerr","header","headerf","headerl","headerr":
+
+	// Highlighting
+	// case "highlightN":
+
+	// Hyphenation Information
+	// case "chhresN","hresN":
+
+	// Index Entries
+	// case "bxe","ixe","pxe","rxe","txe","xe","xefN","yxe":
+
+	// Information Group
+	// case "author","buptim","category","comment","company","creatim","doccomm","dyN","edminsN","hlinkbase","hrN","idN","info","keywords","linkval","manager","minN","moN","nofcharsN","nofcharswsN","nofpagesN","nofwordsN","operator","printim","propname","proptypeN","revtim","secN","staticval","subject","title","userprops","vernN","versionN","yrN":
+
+	// List Levels
+	// case "lvltentative":
+
+	// List Table
+	// case "jclisttab","levelfollowN","levelindentN","leveljcN","leveljcnN","levellegalN","levelnfcN","levelnfcnN","levelnorestartN","levelnumbers","leveloldN","levelpictureN","levelpicturenosize","levelprevN","levelprevspaceN","levelspaceN","levelstartatN","leveltemplateidN","leveltext","lfolevel","list","listhybrid","listidN","listlevel","listname","listoverride","listoverridecountN","listoverrideformatN","listoverridestartat","listoverridetable","listpicture","listrestarthdnN","listsimpleN","liststyleidN","liststylename","listtable","listtemplateidN","lsN":
+
+	// Macintosh Edition Manager Publisher Objects
+	// case "bkmkpub","pubauto":
+
+	// Mail Merge
+	// case "mailmerge","mmaddfieldname","mmattach","mmblanklines","mmconnectstr","mmconnectstrdata","mmdatasource","mmdatatypeaccess","mmdatatypeexcel","mmdatatypefile","mmdatatypeodbc","mmdatatypeodso","mmdatatypeqt","mmdefaultsql","mmdestemail","mmdestfax","mmdestnewdoc 2 007","mmdestprinter","mmerrorsN","mmfttypeaddress","mmfttypebarcode","mmfttypedbcolumn","mmfttypemapped","mmfttypenull","mmfttypesalutation","mmheadersource","mmjdsotypeN","mmlinktoquery","mmmailsubject","mmmaintypecatalog","mmmaintypeemail","mmmaintypeenvelopes","mmmaintypefax","mmmaintypelabels","mmmaintypeletters","mmodso","mmodsoactiveN","mmodsocoldelimN","mmodsocolumnN","mmodsodynaddrN","mmodsofhdrN","mmodsofilter","mmodsofldmpdata","mmodsofmcolumnN","mmodsohashN","mmodsolidN","mmodsomappedname","mmodsoname","mmodsorecipdata","mmodsosort","mmodsosrc ","mmodsotable","mmodsoudl","mmodsoudldata 200 7","mmodsouniquetag","mmquery","mmreccurN","mmshowdata":
+
+	// Math
+	// case "macc","maccPr","maln","malnScr","margPr","margSzN","mbar","mbarPr","mbaseJc","mbegChr","mborderBox","mborderBoxPr","mbox","mboxPr","mbrkBinN","mbrkBinSubN","mbrkN","mcGpN","mcGpRuleN","mchr","mcount","mcSpN","mctrlPr","md","mdefJcN","mdeg","mdegHide","mden","mdiff","mdiffStyN","mdispdefN","mdPr","me","mendChr","meqArr","meqArrPr","mf","mfName","mfPr","mfunc","mfuncPr","mgroupChr","mgroupChrPr","mgrow","mhideBot","mhideLeft","mhideRight","mhideTop","minterSpN","mintLimN","mintraSpN","mjcN","mlim","mlimloc","mlimlow","mlimlowPr","mlimupp","mlimuppPr","mlit","mlMarginN","mm","mmath","mmathFontN","mmathPict","mmathPr","mmaxdist","mmc","mmcJc","mmcPr","mmcs","mmPr","mmr","mnary","mnaryLimN","mnaryPr","mnoBreak","mnor","mnum","mobjDist","moMath","moMathPara","moMathParaPr","mopEmu","mphant","mphantPr","mplcHide","mpos","mpostSpN","mpreSpN","mr","mrad","mradPr","mrMarginN","mrPr","mrSpN","mrSpRuleN","mscrN","msepChr","mshow","mshp","msmallFracN","msPre","msPrePr","msSub","msSubPr","msSubSup","msSubSupPr","msSup","msSupPr","mstrikeBLTR","mstrikeH","mstrikeTLBR","mstrikeV","mstyN","msub","msubHide","msup","msupHide","mtransp","mtype","mvertJc","mwrapIndentN","mwrapRightN","mzeroAsc","mzeroDesc","mzeroWid":
+
+	// Microsoft Office Outlook
+	// case "ebcstart","ebcend":
+
+	// Move Bookmarks
+	// case "mvfmf","mvfml","mvtof","mvtol":
+
+	// New Asia Control Words Created by Word
+	// case "horzvertN","twoinoneN":
+
+	// Objects
+	// case "linkself","objalias","objalignN","objattph","objautlink","objclass","objcropbN","objcroplN","objcroprN","objcroptN","objdata","object","objemb","objhN","objhtml","objicemb","objlink","objlock","objname","objocx","objpub","objscalexN","objscaleyN","objsect","objsetsize","objsub","objtime","objtransyN","objupdate ","objwN","oleclsid","result","rsltbmp","rslthtml","rsltmerge","rsltpict","rsltrtf","rslttxt":
+
+	// Paragraph Borders
+	// case "box","brdrb","brdrbar","brdrbtw","brdrcfN","brdrdash ","brdrdashd","brdrdashdd","brdrdashdot","brdrdashdotdot","brdrdashdotstr","brdrdashsm","brdrdb","brdrdot","brdremboss","brdrengrave","brdrframe","brdrhair","brdrinset","brdrl","brdrnil","brdrnone","brdroutset","brdrr","brdrs","brdrsh","brdrt","brdrtbl","brdrth","brdrthtnlg","brdrthtnmg","brdrthtnsg","brdrtnthlg","brdrtnthmg","brdrtnthsg","brdrtnthtnlg","brdrtnthtnmg","brdrtnthtnsg","brdrtriple","brdrwavy","brdrwavydb","brdrwN","brspN":
+
+	// Paragraph Formatting Properties
+	case "aspalpha", "aspnum", "collapsed", "contextualspace", "cufiN", "culiN", "curiN", "faauto", "facenter", "fafixed", "fahang", "faroman", "favar", "fiN", "hyphpar ", "indmirror", "intbl", "itapN", "keep", "keepn", "levelN", "liN", "linN", "lisaN", "lisbN", "ltrpar", "nocwrap", "noline", "nooverflow", "nosnaplinegrid", "nowidctlpar ", "nowwrap", "outlinelevelN ", "pagebb", "pard", "prauthN", "prdateN", "qc", "qd", "qj", "qkN", "ql", "qr", "qt", "riN", "rinN", "rtlpar", "saautoN", "saN", "sbautoN", "sbN", "sbys", "slmultN", "slN", "sN", "spv", "subdocumentN ", "tscbandhorzeven", "tscbandhorzodd", "tscbandverteven", "tscbandvertodd", "tscfirstcol", "tscfirstrow", "tsclastcol", "tsclastrow", "tscnecell", "tscnwcell", "tscsecell", "tscswcell", "txbxtwalways", "txbxtwfirst", "txbxtwfirstlast", "txbxtwlast", "txbxtwno", "widctlpar", "ytsN":
+		text.WriteString(param)
+
+	// Paragraph Group Properties
+	// case "pgp","pgptbl","ipgpN":
+
+	// Paragraph Revision Mark Properties
+	// case "dfrauthN","dfrdateN","dfrstart","dfrstop","dfrxst":
+
+	// Paragraph Shading
+	// case "bgbdiag","bgcross","bgdcross","bgdkbdiag","bgdkcross","bgdkdcross","bgdkfdiag","bgdkhoriz","bgdkvert","bgfdiag","bghoriz","bgvert","cbpatN","cfpatN","shadingN":
+
+	// Pictures
+	// case "binN","bliptagN","blipuid","blipupiN","defshp","dibitmapN","emfblip","jpegblip","macpict","nonshppict","picbmp ","picbppN ","piccropbN","piccroplN","piccroprN","piccroptN","pichgoalN","pichN","picprop","picscaled","picscalexN","picscaleyN","pict","picwgoalN","picwN","pmmetafileN","pngblip","shppict","wbitmapN","wbmbitspixelN","wbmplanesN","wbmwidthbyteN","wmetafileN":
+
+	// Positioned Objects and Frames
+	// case "abshN","abslock","absnoovrlpN","abswN","dfrmtxtxN","dfrmtxtyN","dropcapliN ","dropcaptN ","dxfrtextN","frmtxbtlr","frmtxlrtb","frmtxlrtbv","frmtxtbrl","frmtxtbrlv","nowrap","overlay","phcol","phmrg","phpg","posnegxN ","posnegyN ","posxc","posxi","posxl","posxN","posxo","posxr","posyb","posyc","posyil","posyin","posyN","posyout","posyt","pvmrg","pvpara","pvpg","wraparound","wrapdefault","wrapthrough","wraptight":
+
+	// Protection Exceptions
+	// case "protend","protstart":
+
+	// Quick Styles
+	// case "noqfpromote":
+
+	// Read-Only Password Protection
+	// case "password","passwordhash":
+
+	// Revision Marks for Paragraph Numbers and ListNum Fields
+	// case "pnrauthN","pnrdateN","pnrnfcN","pnrnot","pnrpnbrN","pnrrgbN","pnrstartN","pnrstopN","pnrxstN":
+
+	// RTF Version
+	// case "rtfN":
+
+	// Section Formatting Properties
+	case "adjustright", "binfsxnN", "binsxnN", "colnoN ", "colsN", "colsrN ", "colsxN", "colwN ", "dsN", "endnhere", "footeryN", "guttersxnN", "headeryN", "horzsect", "linebetcol", "linecont", "linemodN", "lineppage", "linerestart", "linestartsN", "linexN", "lndscpsxn", "ltrsect", "margbsxnN", "marglsxnN", "margmirsxn", "margrsxnN", "margtsxnN", "pghsxnN", "pgnbidia", "pgnbidib", "pgnchosung", "pgncnum", "pgncont", "pgndbnum", "pgndbnumd", "pgndbnumk", "pgndbnumt", "pgndec", "pgndecd", "pgnganada", "pgngbnum", "pgngbnumd", "pgngbnumk", "pgngbnuml", "pgnhindia", "pgnhindib", "pgnhindic", "pgnhindid", "pgnhnN ", "pgnhnsc ", "pgnhnsh ", "pgnhnsm ", "pgnhnsn ", "pgnhnsp ", "pgnid", "pgnlcltr", "pgnlcrm", "pgnrestart", "pgnstartsN", "pgnthaia", "pgnthaib", "pgnthaic", "pgnucltr", "pgnucrm", "pgnvieta", "pgnxN", "pgnyN", "pgnzodiac", "pgnzodiacd", "pgnzodiacl", "pgwsxnN", "pnseclvlN", "rtlsect", "saftnnalc", "saftnnar", "saftnnauc", "saftnnchi", "saftnnchosung", "saftnncnum", "saftnndbar", "saftnndbnum", "saftnndbnumd", "saftnndbnumk", "saftnndbnumt", "saftnnganada", "saftnngbnum", "saftnngbnumd", "saftnngbnumk", "saftnngbnuml", "saftnnrlc", "saftnnruc", "saftnnzodiac", "saftnnzodiacd", "saftnnzodiacl", "saftnrestart", "saftnrstcont", "saftnstartN", "sbkcol", "sbkeven", "sbknone", "sbkodd", "sbkpage", "sectd", "sectdefaultcl", "sectexpandN", "sectlinegridN", "sectspecifycl", "sectspecifygenN", "sectspecifyl", "sectunlocked", "sftnbj", "sftnnalc", "sftnnar", "sftnnauc", "sftnnchi", "sftnnchosung", "sftnncnum", "sftnndbar", "sftnndbnum", "sftnndbnumd", "sftnndbnumk", "sftnndbnumt", "sftnnganada", "sftnngbnum", "sftnngbnumd", "sftnngbnumk", "sftnngbnuml", "sftnnrlc", "sftnnruc", "sftnnzodiac", "sftnnzodiacd", "sftnnzodiacl", "sftnrestart", "sftnrstcont", "sftnrstpg", "sftnstartN", "sftntj", "srauthN", "srdateN", "titlepg", "vertal", "vertalb", "vertalc", "vertalj", "vertalt", "vertsect":
+		text.WriteString(param)
+
+	// Section Text
+	case "stextflowN":
+		text.WriteString(param)
+
+	// SmartTag Data
+	// case "factoidname":
+
+	// Style and Formatting Restrictions
+	// case "latentstyles","lsdlockeddefN","lsdlockedexcept","lsdlockedN","lsdprioritydefN","lsdpriorityN","lsdqformatdefN","lsdqformatN","lsdsemihiddendefN","lsdsemihiddenN","lsdstimaxN","lsdunhideuseddefN","lsdunhideusedN":
+
+	// Style Sheet
+	// case "additive","alt","ctrl","fnN","keycode","sautoupd","sbasedonN","scompose","shidden","shift","slinkN","slocked","snextN","spersonal","spriorityN","sqformat","sreply","ssemihiddenN","stylesheet","styrsidN","sunhideusedN","tsN","tsrowd":
+
+	// Table Definitions
+	case "cell", "cellxN", "clbgbdiag", "clbgcross", "clbgdcross", "clbgdkbdiag", "clbgdkcross", "clbgdkdcross", "clbgdkfdiag", "clbgdkhor", "clbgdkvert", "clbgfdiag", "clbghoriz", "clbgvert", "clbrdrb", "clbrdrl", "clbrdrr", "clbrdrt", "clcbpatN", "clcbpatrawN", "clcfpatN", "clcfpatrawN", "cldel2007", "cldelauthN", "cldeldttmN", "cldgll", "cldglu", "clFitText", "clftsWidthN", "clhidemark", "clins", "clinsauthN", "clinsdttmN", "clmgf", "clmrg", "clmrgd", "clmrgdauthN", "clmrgddttmN", "clmrgdr", "clNoWrap", "clpadbN", "clpadfbN", "clpadflN", "clpadfrN", "clpadftN", "clpadlN", "clpadrN", "clpadtN", "clshdngN", "clshdngrawN", "clshdrawnil", "clspbN", "clspfbN", "clspflN", "clspfrN", "clspftN", "clsplit", "clsplitr", "clsplN", "clsprN", "clsptN", "cltxbtlr", "cltxlrtb", "cltxlrtbv", "cltxtbrl", "cltxtbrlv", "clvertalb", "clvertalc", "clvertalt", "clvmgf", "clvmrg", "clwWidthN", "irowbandN", "irowN", "lastrow", "ltrrow", "nestcell", "nestrow", "nesttableprops", "nonesttables", "rawclbgbdiag", "rawclbgcross", "rawclbgdcross", "rawclbgdkbdiag", "rawclbgdkcross", "rawclbgdkdcross", "rawclbgdkfdiag", "rawclbgdkhor", "rawclbgdkvert", "rawclbgfdiag", "rawclbghoriz", "rawclbgvert", "rtlrow", "tabsnoovrlp", "taprtl", "tblindN", "tblindtypeN", "tbllkbestfit", "tbllkborder", "tbllkcolor", "tbllkfont", "tbllkhdrcols", "tbllkhdrrows", "tbllklastcol", "tbllklastrow", "tbllknocolband", "tbllknorowband", "tbllkshading", "tcelld", "tdfrmtxtBottomN", "tdfrmtxtLeftN", "tdfrmtxtRightN", "tdfrmtxtTopN", "tphcol", "tphmrg", "tphpg", "tposnegxN", "tposnegyN", "tposxc", "tposxi", "tposxl", "tposxN", "tposxo", "tposxr", "tposyb", "tposyc", "tposyil", "tposyin", "tposyN", "tposyout", "tposyt", "tpvmrg", "tpvpara", "tpvpg", "trauthN", "trautofitN", "trbgbdiag", "trbgcross", "trbgdcross", "trbgdkbdiag", "trbgdkcross", "trbgdkdcross", "trbgdkfdiag", "trbgdkhor", "trbgdkvert", "trbgfdiag", "trbghoriz", "trbgvert", "trbrdrb ", "trbrdrh ", "trbrdrl ", "trbrdrr ", "trbrdrt ", "trbrdrv ", "trcbpatN", "trcfpatN", "trdateN", "trftsWidthAN", "trftsWidthBN", "trftsWidthN", "trgaphN", "trhdr ", "trkeep ", "trkeepfollow", "trleftN", "trowd", "trpaddbN", "trpaddfbN", "trpaddflN", "trpaddfrN", "trpaddftN", "trpaddlN", "trpaddrN", "trpaddtN", "trpadobN", "trpadofbN", "trpadoflN", "trpadofrN", "trpadoftN", "trpadolN", "trpadorN", "trpadotN", "trpatN", "trqc", "trql", "trqr", "trrhN", "trshdngN", "trspdbN", "trspdfbN", "trspdflN", "trspdfrN", "trspdftN", "trspdlN", "trspdrN", "trspdtN", "trspobN", "trspofbN", "trspoflN", "trspofrN", "trspoftN", "trspolN", "trsporN", "trspotN", "trwWidthAN", "trwWidthBN", "trwWidthN":
+		text.WriteString(param)
+
+	// Table of Contents Entries
+	case "tc", "tcfN", "tclN", "tcn ":
+		text.WriteString(param)
+
+	// Table Styles
+	// case "tsbgbdiag","tsbgcross","tsbgdcross","tsbgdkbdiag","tsbgdkcross","tsbgdkdcross","tsbgdkfdiag","tsbgdkhor","tsbgdkvert","tsbgfdiag","tsbghoriz","tsbgvert","tsbrdrb","tsbrdrdgl","tsbrdrdgr","tsbrdrh","tsbrdrl","tsbrdrr","tsbrdrr","tsbrdrt","tsbrdrv","tscbandshN","tscbandsvN","tscellcbpatN","tscellcfpatN","tscellpaddbN","tscellpaddfbN","tscellpaddflN","tscellpaddfrN","tscellpaddftN","tscellpaddlN","tscellpaddrN","tscellpaddtN","tscellpctN","tscellwidthftsN","tscellwidthN","tsnowrap","tsvertalb","tsvertalc","tsvertalt":
+
+	// Tabs
+	case "tbN", "tldot", "tleq", "tlhyph", "tlmdot", "tlth", "tlul", "tqc", "tqdec", "tqr", "txN":
+		text.WriteString(param)
+
+	// Theme Data
+	// case "themedata":
+
+	// Theme Font Information
+	// case "fbimajor","fbiminor","fdbmajor","fdbminor","fhimajor","fhiminor","flomajor","flominor":
+
+	// Track Changes
+	// case "revtbl ":
+
+	// Track Changes (Revision Marks)
+	// case "charrsidN","delrsidN","insrsidN","oldcprops","oldpprops","oldsprops","oldtprops","pararsidN","rsidN","rsidrootN","rsidtbl","sectrsidN","tblrsidN":
+
+	// Unicode RTF
+	// case "ucN","ud","uN","upr":
+
+	// User Protection Information
+	// case "protusertbl":
+
+	// Word through Word RTF for Drawing Objects (Shapes)
+	// case "shp","shpbottomN","shpbxcolumn","shpbxignore","shpbxmargin","shpbxpage","shpbyignore","shpbymargin","shpbypage","shpbypara","shpfblwtxtN","shpfhdrN","shpgrp","shpinst","shpleftN","shplidN","shplockanchor","shprightN","shprslt","shptopN","shptxt","shpwrkN","shpwrN","shpzN","sn","sp","sv","svb":
+	default:
 	}
 	return false
 }
