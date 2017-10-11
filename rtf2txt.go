@@ -36,7 +36,7 @@ func Text(r io.Reader) (*bytes.Buffer, error) {
 }
 
 func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
-	control, _, err := tokenizeControl(r)
+	control, num, err := tokenizeControl(r)
 	if err != nil {
 		return err
 	}
@@ -45,7 +45,7 @@ func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
 		if err != nil {
 			return err
 		}
-		if last := s.Peek(); last != nil {
+		if last := s.Peek(); last != "" {
 			val, err := getParams(r) // last control was interrupted, so finish handling Params
 			handleParams(control, val, text)
 			return err
@@ -69,10 +69,10 @@ func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
 		text.WriteByte('\n')
 		return nil
 	}
-	err = handleBinary(r, control)
-	if err != nil {
-		return err
+	if control == "binN" {
+		return handleBinary(r, control, num)
 	}
+
 	if symbol, found := convertSymbol(control); found {
 		text.WriteString(symbol)
 	}
@@ -88,6 +88,7 @@ func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
 
 func tokenizeControl(r peekingReader.Reader) (string, int, error) {
 	var buf bytes.Buffer
+	isHex := false
 	numStart := -1
 	for {
 		p, err := r.Peek(1)
@@ -99,6 +100,10 @@ func tokenizeControl(r peekingReader.Reader) (string, int, error) {
 		case b == '*' && buf.Len() == 0:
 			r.ReadByte() // consume valid digit
 			return "*", -1, nil
+		case b == '\'' && buf.Len() == 0:
+			isHex = true
+			buf.WriteByte(b)
+			r.ReadByte()
 		case b >= '0' && b <= '9' || b == '-':
 			if numStart == -1 {
 				numStart = buf.Len()
@@ -115,6 +120,9 @@ func tokenizeControl(r peekingReader.Reader) (string, int, error) {
 			buf.WriteByte(b)
 			r.ReadByte()
 		default:
+			if isHex {
+				return buf.String(), -1, nil
+			}
 			c, num := canonicalize(buf.String(), numStart)
 			return c, num, nil
 		}
@@ -140,7 +148,7 @@ func getUnicode(control string) (bool, string) {
 	var buf bytes.Buffer
 	for i := 1; i < len(control); i++ {
 		b := control[i]
-		if b >= '0' && b <= '9' {
+		if b >= '0' && b <= '9' || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F' {
 			buf.WriteByte(b)
 		} else {
 			break
@@ -167,25 +175,16 @@ func getParams(r peekingReader.Reader) (string, error) {
 	return string(data), nil
 }
 
-func handleBinary(r peekingReader.Reader, control string) error {
-	if !strings.HasPrefix(control, "bin") || len(control) <= 3 { // wrong control type
+func handleBinary(r peekingReader.Reader, control string, size int) error {
+	if control != "binN" { // wrong control type
 		return nil
 	}
 
-	num, err := strconv.Atoi(control[3:])
-	if err != nil { // not a number so skip
-		return nil
-	}
-	_, err = r.ReadBytes(num)
+	_, err := r.ReadBytes(size)
 	if err != nil {
 		return err
 	}
 	return nil
-}
-
-func readText(r peekingReader.Reader) (string, error) {
-	data, err := peekingReader.ReadUntilAny(r, []byte{'\\', '{', '}', '\n', '\r'})
-	return string(data), err
 }
 
 func readUntilClosingBrace(r peekingReader.Reader) error {
