@@ -14,15 +14,15 @@ import (
 
 // Text is used to convert an io.Reader containing RTF data into
 // plain text
-func Text(r io.Reader) (io.Reader, error) {
-	buf := peekingReader.NewBufReader(r)
+func Text(r io.Reader) (*bytes.Buffer, error) {
+	pr := peekingReader.NewBufReader(r)
 
 	var text bytes.Buffer
 	var symbolStack stack
-	for b, err := buf.ReadByte(); err == nil; b, err = buf.ReadByte() {
+	for b, err := pr.ReadByte(); err == nil; b, err = pr.ReadByte() {
 		switch b {
 		case '\\':
-			err := readControl(buf, &symbolStack, &text)
+			err := readControl(pr, &symbolStack, &text)
 			if err != nil {
 				return nil, err
 			}
@@ -36,7 +36,7 @@ func Text(r io.Reader) (io.Reader, error) {
 }
 
 func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
-	control, _, err := getControl(r)
+	control, _, err := tokenizeControl(r)
 	if err != nil {
 		return err
 	}
@@ -75,7 +75,6 @@ func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
 	}
 	if symbol, found := convertSymbol(control); found {
 		text.WriteString(symbol)
-		return nil
 	}
 
 	val, err := getParams(r)
@@ -87,7 +86,7 @@ func readControl(r peekingReader.Reader, s *stack, text *bytes.Buffer) error {
 	return nil
 }
 
-func getControl(r peekingReader.Reader) (string, int, error) {
+func tokenizeControl(r peekingReader.Reader) (string, int, error) {
 	var buf bytes.Buffer
 	numStart := -1
 	for {
@@ -97,6 +96,9 @@ func getControl(r peekingReader.Reader) (string, int, error) {
 		}
 		b := p[0]
 		switch {
+		case b == '*' && buf.Len() == 0:
+			r.ReadByte() // consume valid digit
+			return "*", -1, nil
 		case b >= '0' && b <= '9' || b == '-':
 			if numStart == -1 {
 				numStart = buf.Len()
@@ -204,7 +206,13 @@ func readUntilClosingBrace(r peekingReader.Reader) error {
 	return err
 }
 
-func handleParams(control, param string, text *bytes.Buffer) bool {
+func handleParams(control, param string, text *bytes.Buffer) {
+	if strings.HasPrefix(param, " ") {
+		param = param[1:]
+	}
+	if param == "" {
+		return
+	}
 	switch control {
 	// Absolution Position Tabs
 	// case "pindtabqc", "pindtabql", "pindtabqr", "pmartabqc", "pmartabql", "pmartabqr", "ptabldot", "ptablmdot", "ptablminus", "ptablnone", "ptabluscore":
@@ -383,6 +391,10 @@ func handleParams(control, param string, text *bytes.Buffer) bool {
 	// SmartTag Data
 	// case "factoidname":
 
+	// Special Characters
+	case "-", ":", "_", "{", "|", "}", "~", "bullet", "chatn", "chdate", "chdpa", "chdpl", "chftn", "chftnsep", "chftnsepc", "chpgn", "chtime", "column", "emdash", "emspace ", "endash", "enspace ", "lbrN", "ldblquote", "line", "lquote", "ltrmark", "page", "par", "qmspace", "rdblquote", "row", "rquote", "rtlmark", "sect", "sectnum", "softcol ", "softlheightN ", "softline ", "softpage ", "tab", "zwbo", "zwj", "zwnbo", "zwnj":
+		text.WriteString(param)
+
 	// Style and Formatting Restrictions
 	// case "latentstyles","lsdlockeddefN","lsdlockedexcept","lsdlockedN","lsdprioritydefN","lsdpriorityN","lsdqformatdefN","lsdqformatN","lsdsemihiddendefN","lsdsemihiddenN","lsdstimaxN","lsdunhideuseddefN","lsdunhideusedN":
 
@@ -426,7 +438,6 @@ func handleParams(control, param string, text *bytes.Buffer) bool {
 	// case "shp","shpbottomN","shpbxcolumn","shpbxignore","shpbxmargin","shpbxpage","shpbyignore","shpbymargin","shpbypage","shpbypara","shpfblwtxtN","shpfhdrN","shpgrp","shpinst","shpleftN","shplidN","shplockanchor","shprightN","shprslt","shptopN","shptxt","shpwrkN","shpwrN","shpzN","sn","sp","sv","svb":
 	default:
 	}
-	return false
 }
 
 func convertSymbol(symbol string) (string, bool) {
